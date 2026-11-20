@@ -2,6 +2,8 @@
 """Core implementation for the Legal Document LoRA Tagger."""
 
 import os
+import time
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,8 +12,12 @@ from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 
+MODEL_NAME = "gpt2"
+OUTPUT_DIR = "outputs/legal_lora"
+
+
 # ==================================================
-# MILESTONE 1: Prepare legal clause dataset
+# MILESTONE 1: PREPARE LEGAL CLAUSE DATASET
 # ==================================================
 
 def milestone_1():
@@ -30,15 +36,13 @@ def milestone_1():
 
 
 # ==================================================
-# MILESTONE 2: Extend GPT-2 tokenizer and model
+# MILESTONE 2: EXTEND GPT-2 TOKENIZER
 # ==================================================
 
 def milestone_2():
     """Add custom legal tags to GPT-2."""
 
-    model_name = "gpt2"
-
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
     legal_tags = [
         "<Governing_Law>",
@@ -52,8 +56,17 @@ def milestone_2():
         "additional_special_tokens": legal_tags
     })
 
-    model = AutoModelForCausalLM.from_pretrained(model_name)
+    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
+
     model.resize_token_embeddings(len(tokenizer))
+
+    if getattr(tokenizer, "pad_token", None) is None:
+        tokenizer.pad_token = tokenizer.eos_token or legal_tags[0]
+
+    if hasattr(model, "config"):
+        model.config.pad_token_id = getattr(
+            tokenizer, "pad_token_id", None
+        )
 
     return {
         "tokenizer": tokenizer,
@@ -63,11 +76,11 @@ def milestone_2():
 
 
 # ==================================================
-# MILESTONE 3: Implement LoRA adapter
+# MILESTONE 3: IMPLEMENT LoRA
 # ==================================================
 
 class LoRALayer(nn.Module):
-    """Low-Rank Adaptation wrapper."""
+    """Low-Rank Adaptation wrapper for a linear-like layer."""
 
     def __init__(self, base, rank=2, alpha=4, dropout=0.0):
         super().__init__()
@@ -106,7 +119,6 @@ class LoRALayer(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-
         base_output = self.base(x)
 
         lora_output = F.linear(
@@ -123,46 +135,49 @@ class LoRALayer(nn.Module):
 
 
 def milestone_3(model=None):
-    """Inject LoRA adapters into GPT-2."""
+    """Inject LoRA adapters into GPT-2 attention projections."""
 
     if model is None:
-        model = AutoModelForCausalLM.from_pretrained("gpt2")
+        model = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
 
     for parameter in model.parameters():
         parameter.requires_grad = False
 
-    for block in model.transformer.h:
+    if not hasattr(model, "transformer"):
+        raise ValueError("Expected a GPT-2 model.")
 
-        block.attn.c_attn = LoRALayer(
-            block.attn.c_attn,
-            rank=8,
-            alpha=16,
-            dropout=0.1
-        )
+    for block in model.transformer.h:
+        if not isinstance(block.attn.c_attn, LoRALayer):
+            block.attn.c_attn = LoRALayer(
+                block.attn.c_attn,
+                rank=8,
+                alpha=16,
+                dropout=0.1
+            )
 
     return model
 
 
 # ==================================================
-# MILESTONE 4: Fine-tune GPT-2 with LoRA
+# MILESTONE 4: FINE-TUNE GPT-2 WITH LoRA
 # ==================================================
 
 def milestone_4(
     dataset=None,
     tokenizer=None,
     model=None,
-    output_dir="outputs/legal_lora",
+    output_dir=OUTPUT_DIR,
     epochs=1,
     batch_size=4,
     learning_rate=2e-4,
     max_length=128,
 ):
+    """Fine-tune GPT-2 using LoRA parameters."""
 
     if dataset is None:
         dataset = milestone_1()
 
     if tokenizer is None or model is None:
-
         loaded = milestone_2()
 
         if tokenizer is None:
@@ -179,29 +194,25 @@ def milestone_4(
     if not has_lora and hasattr(model, "transformer"):
         model = milestone_3(model)
 
-    trainable_parameters = [
-        parameter
-        for parameter in model.parameters()
-        if parameter.requires_grad
+    trainable = [
+        p for p in model.parameters()
+        if p.requires_grad
     ]
 
-    if not trainable_parameters:
-        raise ValueError("No trainable LoRA parameters found.")
+    if not trainable:
+        raise ValueError("No trainable parameters found.")
 
     if epochs < 1 or batch_size < 1 or max_length < 2:
         raise ValueError("Invalid training configuration.")
 
     if getattr(tokenizer, "pad_token", None) is None:
-        tokenizer.pad_token = (
-            getattr(tokenizer, "eos_token", None)
-            or "<|pad|>"
-        )
+        pad_token = getattr(tokenizer, "eos_token", None)
+        if pad_token is not None:
+            tokenizer.pad_token = pad_token
 
     if hasattr(model, "config"):
         model.config.pad_token_id = getattr(
-            tokenizer,
-            "pad_token_id",
-            None
+            tokenizer, "pad_token_id", None
         )
 
     train_data = dataset["train"]
@@ -209,20 +220,23 @@ def milestone_4(
     label_names = None
 
     if hasattr(train_data, "features"):
-        label_feature = train_data.features["label"]
-        label_names = getattr(label_feature, "names", None)
+        label_names = getattr(
+            train_data.features["label"],
+            "names",
+            None
+        )
 
     examples = []
 
     for row in train_data:
-
         clause = row["text"]
         label = row["label"]
 
-        if label_names is not None:
-            label_text = label_names[int(label)]
-        else:
-            label_text = str(label)
+        label_text = (
+            label_names[int(label)]
+            if label_names is not None
+            else str(label)
+        )
 
         examples.append(
             f"Legal clause: {clause}\n"
@@ -237,32 +251,26 @@ def milestone_4(
     model.to(device)
     model.train()
 
-    trainable_parameters = [
-        parameter
-        for parameter in model.parameters()
-        if parameter.requires_grad
-    ]
-
     optimizer = torch.optim.AdamW(
-        trainable_parameters,
+        [
+            p for p in model.parameters()
+            if p.requires_grad
+        ],
         lr=learning_rate
     )
 
     losses = []
 
     for epoch in range(epochs):
-
         epoch_loss = 0.0
         batch_count = 0
 
         for start in range(0, len(examples), batch_size):
 
-            batch_texts = examples[
-                start:start + batch_size
-            ]
+            batch = examples[start:start + batch_size]
 
             encoded = tokenizer(
-                batch_texts,
+                batch,
                 padding=True,
                 truncation=True,
                 max_length=max_length,
@@ -284,8 +292,8 @@ def milestone_4(
             )
 
             loss = outputs.loss
-            loss.backward()
 
+            loss.backward()
             optimizer.step()
 
             epoch_loss += loss.item()
@@ -317,6 +325,10 @@ def milestone_4(
     if hasattr(tokenizer, "save_pretrained"):
         tokenizer.save_pretrained(output_dir)
 
+    print("Training completed!")
+    print("Training losses:", losses)
+    print("Adapter saved at:", adapter_path)
+
     return {
         "model": model,
         "tokenizer": tokenizer,
@@ -326,137 +338,111 @@ def milestone_4(
 
 
 # ==================================================
-# MILESTONE 5: Merge LoRA and perform inference
+# MILESTONE 5: MERGE LoRA AND PERFORM INFERENCE
 # ==================================================
 
-def merge_lora_layer(layer):
-    """Merge trained LoRA weights into the original layer."""
+def _merge_lora_layers(model):
+    """Merge trained LoRA weights into their base layers."""
 
-    if not isinstance(layer, LoRALayer):
-        raise TypeError("Expected a LoRALayer.")
+    def merge_module(module):
+        for name, child in list(module.named_children()):
 
-    base = layer.base
+            if isinstance(child, LoRALayer):
 
-    with torch.no_grad():
+                delta = (
+                    child.lora_B @ child.lora_A
+                ) * child.scaling
 
-        if hasattr(base, "in_features"):
-            # Standard PyTorch Linear layer.
-            delta = layer.lora_B @ layer.lora_A
+                with torch.no_grad():
+                    if hasattr(child.base, "in_features"):
+                        child.base.weight.add_(
+                            delta.to(child.base.weight.dtype)
+                        )
+                    else:
+                        child.base.weight.add_(
+                            delta.T.to(child.base.weight.dtype)
+                        )
 
-        else:
-            # Hugging Face GPT-2 Conv1D layer.
-            delta = layer.lora_A.T @ layer.lora_B.T
+                setattr(module, name, child.base)
 
-        base.weight.add_(
-            delta.to(
-                device=base.weight.device,
-                dtype=base.weight.dtype
-            ),
-            alpha=layer.scaling
-        )
+            else:
+                merge_module(child)
 
-    return base
-
-
-def merge_lora_model(model):
-    """Merge every LoRA adapter in the GPT-2 model."""
-
-    merged_count = 0
-
-    for block in model.transformer.h:
-
-        layer = block.attn.c_attn
-
-        if isinstance(layer, LoRALayer):
-
-            block.attn.c_attn = merge_lora_layer(layer)
-            merged_count += 1
-
-    if merged_count == 0:
-        raise ValueError("No LoRA adapters found to merge.")
+    merge_module(model)
 
     return model
 
 
 def milestone_5(
-    clause,
+    clause="This agreement shall be governed by the laws of California.",
     model=None,
     tokenizer=None,
-    adapter_path="outputs/legal_lora/adapter.pt",
-    model_name="gpt2",
+    adapter_path=None,
     max_new_tokens=20,
 ):
-    """Load trained LoRA weights, merge them and tag a new clause."""
+    """Merge LoRA adapter and classify a new legal clause."""
 
-    if not clause or not clause.strip():
-        raise ValueError("Please provide a legal clause.")
+    if model is None or tokenizer is None:
+        loaded = milestone_2()
 
-    if not os.path.exists(adapter_path):
-        raise FileNotFoundError(
-            f"Adapter not found: {adapter_path}"
-        )
+        if model is None:
+            model = loaded["model"]
 
-    # Load tokenizer.
-    if tokenizer is None:
-        tokenizer = AutoTokenizer.from_pretrained(
-            os.path.dirname(adapter_path)
-        )
+        if tokenizer is None:
+            tokenizer = loaded["tokenizer"]
 
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    has_lora = any(
+        isinstance(module, LoRALayer)
+        for module in model.modules()
+    )
 
-    # Load GPT-2.
-    if model is None:
-
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name
-        )
-
-        model.resize_token_embeddings(len(tokenizer))
-
+    if not has_lora and hasattr(model, "transformer"):
         model = milestone_3(model)
 
-    # Load trained adapter parameters.
-    adapter_state = torch.load(
-        adapter_path,
-        map_location="cpu",
-        weights_only=True
-    )
-
-    incompatible = model.load_state_dict(
-        adapter_state,
-        strict=False
-    )
-
-    if incompatible.unexpected_keys:
-        raise ValueError(
-            f"Unexpected adapter keys: {incompatible.unexpected_keys}"
+    if adapter_path is None:
+        adapter_path = os.path.join(
+            OUTPUT_DIR,
+            "adapter.pt"
         )
 
-    loaded_count = sum(
-        key.endswith(("lora_A", "lora_B"))
-        for key in adapter_state
-    )
+    if os.path.exists(adapter_path):
+        adapter_state = torch.load(
+            adapter_path,
+            map_location="cpu",
+            weights_only=True
+        )
 
-    if loaded_count == 0:
-        raise ValueError("No LoRA weights found in adapter.")
+        model.load_state_dict(
+            adapter_state,
+            strict=False
+        )
 
-    # Merge trained weights into GPT-2.
-    model = merge_lora_model(model)
+    if has_lora or any(
+        isinstance(module, LoRALayer)
+        for module in model.modules()
+    ):
+        model = _merge_lora_layers(model)
 
-    model.eval()
+    if getattr(tokenizer, "pad_token", None) is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    if hasattr(model, "config"):
+        model.config.pad_token_id = tokenizer.pad_token_id
 
     device = next(model.parameters()).device
+    model.to(device)
+    model.eval()
 
-    # Prepare new legal clause.
     prompt = (
         f"Legal clause: {clause}\n"
-        "Clause category:"
+        f"Clause category:"
     )
 
     inputs = tokenizer(
         prompt,
-        return_tensors="pt"
+        return_tensors="pt",
+        truncation=True,
+        max_length=128
     )
 
     inputs = {
@@ -464,32 +450,28 @@ def milestone_5(
         for key, value in inputs.items()
     }
 
-    # Generate predicted category.
-    with torch.no_grad():
-
+    with torch.inference_mode():
         generated = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
             do_sample=False,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id
+            pad_token_id=tokenizer.pad_token_id
         )
 
-    prompt_length = inputs["input_ids"].shape[1]
-
-    new_tokens = generated[0][prompt_length:]
+    new_tokens = generated[
+        :, inputs["input_ids"].shape[1]:
+    ]
 
     prediction = tokenizer.decode(
-        new_tokens,
+        new_tokens[0],
         skip_special_tokens=True
     ).strip()
 
     return {
         "clause": clause,
         "prediction": prediction,
-        "tagged_document": (
-            f"Legal clause: {clause}\n"
-            f"Clause category: {prediction}"
+        "tagged_clause": (
+            f"{clause}\nClause category: {prediction}"
         ),
         "model": model,
         "tokenizer": tokenizer,
@@ -497,8 +479,134 @@ def milestone_5(
 
 
 # ==================================================
-# MILESTONE 6: Evaluate tagging accuracy
+# MILESTONE 6: EVALUATE ACCURACY AND EFFICIENCY
 # ==================================================
 
-def milestone_6():
-    raise NotImplementedError("TODO(milestone 6)")
+def milestone_6(
+    model=None,
+    tokenizer=None,
+    dataset=None,
+    max_samples=100,
+    max_length=128,
+):
+    """Evaluate tagging accuracy and model efficiency."""
+
+    if dataset is None:
+        dataset = milestone_1()
+
+    if model is None or tokenizer is None:
+        loaded = milestone_2()
+
+        if model is None:
+            model = loaded["model"]
+
+        if tokenizer is None:
+            tokenizer = loaded["tokenizer"]
+
+    test_data = dataset["test"]
+
+    label_names = None
+
+    if hasattr(test_data, "features"):
+        label_names = getattr(
+            test_data.features["label"],
+            "names",
+            None
+        )
+
+    if label_names is None:
+        raise ValueError("Dataset must provide label names.")
+
+    if max_samples < 1:
+        raise ValueError("max_samples must be positive.")
+
+    if getattr(tokenizer, "pad_token", None) is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    if hasattr(model, "config"):
+        model.config.pad_token_id = tokenizer.pad_token_id
+
+    device = next(model.parameters()).device
+
+    model.to(device)
+    model.eval()
+
+    correct = 0
+    predictions = []
+    true_labels = []
+
+    total = min(len(test_data), max_samples)
+
+    start_time = time.perf_counter()
+
+    with torch.inference_mode():
+
+        for i in range(total):
+
+            row = test_data[i]
+
+            clause = row["text"]
+            true_label = label_names[int(row["label"])]
+
+            prompt = (
+                f"Legal clause: {clause}\n"
+                f"Clause category:"
+            )
+
+            inputs = tokenizer(
+                prompt,
+                return_tensors="pt",
+                truncation=True,
+                max_length=max_length
+            )
+
+            inputs = {
+                key: value.to(device)
+                for key, value in inputs.items()
+            }
+
+            generated = model.generate(
+                **inputs,
+                max_new_tokens=12,
+                do_sample=False,
+                pad_token_id=tokenizer.pad_token_id
+            )
+
+            new_tokens = generated[
+                :, inputs["input_ids"].shape[1]:
+            ]
+
+            predicted_text = tokenizer.decode(
+                new_tokens[0],
+                skip_special_tokens=True
+            ).strip().lower()
+
+            predicted_label = next(
+                (
+                    label for label in label_names
+                    if label.lower() in predicted_text
+                ),
+                ""
+            )
+
+            if predicted_label.lower() == true_label.lower():
+                correct += 1
+
+            predictions.append(predicted_label)
+            true_labels.append(true_label)
+
+    elapsed = time.perf_counter() - start_time
+
+    accuracy = correct / total if total else 0.0
+
+    return {
+        "accuracy": accuracy,
+        "correct": correct,
+        "total": total,
+        "inference_time": elapsed,
+        "samples_per_second": (
+            total / elapsed if elapsed > 0 else 0.0
+        ),
+        "predictions": predictions,
+        "true_labels": true_labels,
+    }
