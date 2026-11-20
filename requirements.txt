@@ -1,0 +1,6 @@
+httpx
+pytest
+datasets
+transformers
+torch
+numpy
