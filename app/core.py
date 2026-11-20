@@ -53,7 +53,6 @@ def milestone_2():
     })
 
     model = AutoModelForCausalLM.from_pretrained(model_name)
-
     model.resize_token_embeddings(len(tokenizer))
 
     return {
@@ -68,7 +67,7 @@ def milestone_2():
 # ==================================================
 
 class LoRALayer(nn.Module):
-    """Low-Rank Adaptation wrapper for a linear-like layer."""
+    """Low-Rank Adaptation wrapper."""
 
     def __init__(self, base, rank=2, alpha=4, dropout=0.0):
         super().__init__()
@@ -88,11 +87,9 @@ class LoRALayer(nn.Module):
             input_size = base.weight.shape[0]
             output_size = base.weight.shape[1]
 
-        # Freeze original weights.
         for parameter in self.base.parameters():
             parameter.requires_grad = False
 
-        # Trainable low-rank matrices.
         self.lora_A = nn.Parameter(
             torch.empty(rank, input_size)
         )
@@ -109,7 +106,6 @@ class LoRALayer(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        """Combine base output and LoRA update."""
 
         base_output = self.base(x)
 
@@ -127,17 +123,16 @@ class LoRALayer(nn.Module):
 
 
 def milestone_3(model=None):
-    """Inject LoRA adapters into GPT-2 attention projections."""
+    """Inject LoRA adapters into GPT-2."""
 
     if model is None:
         model = AutoModelForCausalLM.from_pretrained("gpt2")
 
-    # Freeze original GPT-2 parameters.
     for parameter in model.parameters():
         parameter.requires_grad = False
 
-    # Inject LoRA into attention projections.
     for block in model.transformer.h:
+
         block.attn.c_attn = LoRALayer(
             block.attn.c_attn,
             rank=8,
@@ -162,13 +157,10 @@ def milestone_4(
     learning_rate=2e-4,
     max_length=128,
 ):
-    """Fine-tune GPT-2 using LoRA parameters."""
 
-    # Load dataset.
     if dataset is None:
         dataset = milestone_1()
 
-    # Load tokenizer and model.
     if tokenizer is None or model is None:
 
         loaded = milestone_2()
@@ -179,17 +171,14 @@ def milestone_4(
         if model is None:
             model = loaded["model"]
 
-    # Check whether LoRA is already injected.
     has_lora = any(
         isinstance(module, LoRALayer)
         for module in model.modules()
     )
 
-    # Inject LoRA into real GPT-2 models.
     if not has_lora and hasattr(model, "transformer"):
         model = milestone_3(model)
 
-    # Find trainable parameters.
     trainable_parameters = [
         parameter
         for parameter in model.parameters()
@@ -202,14 +191,12 @@ def milestone_4(
     if epochs < 1 or batch_size < 1 or max_length < 2:
         raise ValueError("Invalid training configuration.")
 
-    # Set padding token safely.
     if getattr(tokenizer, "pad_token", None) is None:
         tokenizer.pad_token = (
             getattr(tokenizer, "eos_token", None)
             or "<|pad|>"
         )
 
-    # Configure padding for real language models.
     if hasattr(model, "config"):
         model.config.pad_token_id = getattr(
             tokenizer,
@@ -219,14 +206,12 @@ def milestone_4(
 
     train_data = dataset["train"]
 
-    # Get actual LEDGAR category names.
     label_names = None
 
     if hasattr(train_data, "features"):
         label_feature = train_data.features["label"]
         label_names = getattr(label_feature, "names", None)
 
-    # Prepare examples.
     examples = []
 
     for row in train_data:
@@ -239,22 +224,19 @@ def milestone_4(
         else:
             label_text = str(label)
 
-        example = (
+        examples.append(
             f"Legal clause: {clause}\n"
             f"Clause category: {label_text}"
         )
 
-        examples.append(example)
-
     if not examples:
         raise ValueError("Training dataset is empty.")
 
-    # Set device.
     device = next(model.parameters()).device
+
     model.to(device)
     model.train()
 
-    # Optimize only trainable parameters.
     trainable_parameters = [
         parameter
         for parameter in model.parameters()
@@ -268,7 +250,6 @@ def milestone_4(
 
     losses = []
 
-    # Training loop.
     for epoch in range(epochs):
 
         epoch_loss = 0.0
@@ -292,7 +273,6 @@ def milestone_4(
             attention_mask = encoded["attention_mask"].to(device)
 
             labels = input_ids.clone()
-
             labels[attention_mask == 0] = -100
 
             optimizer.zero_grad()
@@ -304,7 +284,6 @@ def milestone_4(
             )
 
             loss = outputs.loss
-
             loss.backward()
 
             optimizer.step()
@@ -313,7 +292,6 @@ def milestone_4(
             batch_count += 1
 
         average_loss = epoch_loss / batch_count
-
         losses.append(average_loss)
 
         print(
@@ -321,7 +299,6 @@ def milestone_4(
             f"- Loss: {average_loss:.4f}"
         )
 
-    # Save adapter.
     os.makedirs(output_dir, exist_ok=True)
 
     adapter_state = {
@@ -337,7 +314,6 @@ def milestone_4(
 
     torch.save(adapter_state, adapter_path)
 
-    # Save tokenizer if supported.
     if hasattr(tokenizer, "save_pretrained"):
         tokenizer.save_pretrained(output_dir)
 
@@ -353,8 +329,171 @@ def milestone_4(
 # MILESTONE 5: Merge LoRA and perform inference
 # ==================================================
 
-def milestone_5():
-    raise NotImplementedError("TODO(milestone 5)")
+def merge_lora_layer(layer):
+    """Merge trained LoRA weights into the original layer."""
+
+    if not isinstance(layer, LoRALayer):
+        raise TypeError("Expected a LoRALayer.")
+
+    base = layer.base
+
+    with torch.no_grad():
+
+        if hasattr(base, "in_features"):
+            # Standard PyTorch Linear layer.
+            delta = layer.lora_B @ layer.lora_A
+
+        else:
+            # Hugging Face GPT-2 Conv1D layer.
+            delta = layer.lora_A.T @ layer.lora_B.T
+
+        base.weight.add_(
+            delta.to(
+                device=base.weight.device,
+                dtype=base.weight.dtype
+            ),
+            alpha=layer.scaling
+        )
+
+    return base
+
+
+def merge_lora_model(model):
+    """Merge every LoRA adapter in the GPT-2 model."""
+
+    merged_count = 0
+
+    for block in model.transformer.h:
+
+        layer = block.attn.c_attn
+
+        if isinstance(layer, LoRALayer):
+
+            block.attn.c_attn = merge_lora_layer(layer)
+            merged_count += 1
+
+    if merged_count == 0:
+        raise ValueError("No LoRA adapters found to merge.")
+
+    return model
+
+
+def milestone_5(
+    clause,
+    model=None,
+    tokenizer=None,
+    adapter_path="outputs/legal_lora/adapter.pt",
+    model_name="gpt2",
+    max_new_tokens=20,
+):
+    """Load trained LoRA weights, merge them and tag a new clause."""
+
+    if not clause or not clause.strip():
+        raise ValueError("Please provide a legal clause.")
+
+    if not os.path.exists(adapter_path):
+        raise FileNotFoundError(
+            f"Adapter not found: {adapter_path}"
+        )
+
+    # Load tokenizer.
+    if tokenizer is None:
+        tokenizer = AutoTokenizer.from_pretrained(
+            os.path.dirname(adapter_path)
+        )
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # Load GPT-2.
+    if model is None:
+
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name
+        )
+
+        model.resize_token_embeddings(len(tokenizer))
+
+        model = milestone_3(model)
+
+    # Load trained adapter parameters.
+    adapter_state = torch.load(
+        adapter_path,
+        map_location="cpu",
+        weights_only=True
+    )
+
+    incompatible = model.load_state_dict(
+        adapter_state,
+        strict=False
+    )
+
+    if incompatible.unexpected_keys:
+        raise ValueError(
+            f"Unexpected adapter keys: {incompatible.unexpected_keys}"
+        )
+
+    loaded_count = sum(
+        key.endswith(("lora_A", "lora_B"))
+        for key in adapter_state
+    )
+
+    if loaded_count == 0:
+        raise ValueError("No LoRA weights found in adapter.")
+
+    # Merge trained weights into GPT-2.
+    model = merge_lora_model(model)
+
+    model.eval()
+
+    device = next(model.parameters()).device
+
+    # Prepare new legal clause.
+    prompt = (
+        f"Legal clause: {clause}\n"
+        "Clause category:"
+    )
+
+    inputs = tokenizer(
+        prompt,
+        return_tensors="pt"
+    )
+
+    inputs = {
+        key: value.to(device)
+        for key, value in inputs.items()
+    }
+
+    # Generate predicted category.
+    with torch.no_grad():
+
+        generated = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id
+        )
+
+    prompt_length = inputs["input_ids"].shape[1]
+
+    new_tokens = generated[0][prompt_length:]
+
+    prediction = tokenizer.decode(
+        new_tokens,
+        skip_special_tokens=True
+    ).strip()
+
+    return {
+        "clause": clause,
+        "prediction": prediction,
+        "tagged_document": (
+            f"Legal clause: {clause}\n"
+            f"Clause category: {prediction}"
+        ),
+        "model": model,
+        "tokenizer": tokenizer,
+    }
 
 
 # ==================================================
