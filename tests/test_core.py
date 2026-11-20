@@ -56,7 +56,7 @@ def test_milestone_2(monkeypatch):
     assert model.resized_to == len(tokenizer)
 
 
-# Milestone 3: Implement LoRA adapter
+# Milestone 3: LoRA adapter
 def test_milestone_3():
     base_layer = nn.Linear(10, 5)
 
@@ -81,19 +81,61 @@ def test_milestone_3():
     assert adapter.lora_B.requires_grad
 
 
-# Milestone 4
-@pytest.mark.skip(reason="not started yet")
-def test_milestone_4():
-    raise NotImplementedError("TODO(milestone 4)")
+# Milestone 4: Fine-tune GPT-2 with LoRA
+def test_milestone_4(tmp_path):
+    class FakeTokenizer:
+        def __call__(self, texts, **kwargs):
+            batch_size = len(texts)
+            return {
+                "input_ids": torch.ones(batch_size, 4, dtype=torch.long),
+                "attention_mask": torch.ones(batch_size, 4, dtype=torch.long),
+            }
+
+    class FakeOutput:
+        def __init__(self, loss):
+            self.loss = loss
+
+    class FakeModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lora_parameter = nn.Parameter(torch.tensor(0.5))
+
+        def forward(self, input_ids, attention_mask, labels):
+            loss = self.lora_parameter ** 2
+            return FakeOutput(loss)
+
+    dataset = {
+        "train": [
+            {"text": "The agreement is governed by law.", "label": 0},
+            {"text": "The parties agree to indemnify.", "label": 1},
+        ]
+    }
+
+    model = FakeModel()
+    tokenizer = FakeTokenizer()
+
+    result = core.milestone_4(
+        dataset=dataset,
+        tokenizer=tokenizer,
+        model=model,
+        output_dir=str(tmp_path),
+        epochs=1,
+        batch_size=2,
+    )
+
+    assert result["model"] is model
+    assert result["tokenizer"] is tokenizer
+    assert len(result["losses"]) > 0
+    assert (tmp_path / "adapter.pt").exists()
 
 
-# Milestone 5
+# Milestone 5: Merge LoRA and inference
 @pytest.mark.skip(reason="not started yet")
 def test_milestone_5():
     raise NotImplementedError("TODO(milestone 5)")
 
 
-# Milestone 6
+# Milestone 6: Evaluation
 @pytest.mark.skip(reason="not started yet")
 def test_milestone_6():
     raise NotImplementedError("TODO(milestone 6)")
